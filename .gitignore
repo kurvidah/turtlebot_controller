@@ -1,0 +1,14 @@
+# Byte-compiled / cache
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Test/tooling caches
+.pytest_cache/
+.mypy_cache/
+.pytype/
+.pyre/
+
+# IPython / Jupyter
+.ipynb_checkpoints
