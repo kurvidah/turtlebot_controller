@@ -39,7 +39,7 @@ Kp_ang = 2.0          # angular P gain (rad/s per rad of error)
 Kp_lin = 0.6          # linear P gain  (m/s per m of error)
 LIN_MAX = 0.25        # max |linear x| m/s
 ANG_MAX = 1.2         # max |angular z| rad/s
-YAW_TOL_DEG = 0.2     # stop turning within this tolerance
+YAW_TOL_DEG = 0.5     # stop turning within this tolerance
 POS_TOL_M = 0.05      # stop at goal if closer than this
 DT = 0.1              # control period (s)
 
@@ -141,16 +141,17 @@ class Turtlebot3Controller(Node):
             
         # if self.actions[self.state]():
         #     self.state = (self.state + 1) % len(self.actions)
-        self.get_logger().info(f"{DetectSurroundings(self)}")
+        # self.get_logger().info(f"{DetectSurroundings(self)}")
         if self.state == 0:
             # self.get_logger().info("State 0: Going until North wall detected...")
-            if GoUntil(self, {"north":True}):
-                self.state = 1
-                # self.get_logger().info("North wall detected. Transitioning to State 1.")
-        elif self.state == 1:
-            self.get_logger().info("State 1: Turning right 90 degrees...")
-            if TurnTo(self, -90):
+            if GoToNextNode(self, prefer_turn='left'):
                 self.state = 0
+                self.get_logger().info("Continue")
+        elif self.state == 1:
+            robotStop(self)
+            # self.get_logger().info("State 1: Turning right 90 degrees...")
+            # if TurnTo(self, -90):
+            #     self.state = 0
                 # self.get_logger().info("Turn complete. Transitioning to State 0.")
 
 def robotStop(node: Turtlebot3Controller):
@@ -173,19 +174,19 @@ def DetectSurroundings(self, wall_threshold=0.18):
     ranges = [rmax if r == 0.0 else r for r in ranges]
     
     # North: front sector (e.g., -30 to +30 degrees)
-    north_ranges = ranges[0:30] + ranges[330:360]
+    north_ranges = ranges[0:2] + ranges[358:360]
     min_north_dist = min(north_ranges) if north_ranges else rmax
 
     # East: right sector (e.g., 60 to 120 degrees)
-    east_ranges = ranges[60:120]
+    east_ranges = ranges[268:272]
     min_east_dist = min(east_ranges) if east_ranges else rmax
 
     # South: back sector (e.g., 150 to 210 degrees)
-    south_ranges = ranges[150:210]
+    south_ranges = ranges[178:182]
     min_south_dist = min(south_ranges) if south_ranges else rmax
 
     # West: left sector (e.g., 240 to 300 degrees)
-    west_ranges = ranges[240:300]
+    west_ranges = ranges[88:92]
     min_west_dist = min(west_ranges) if west_ranges else rmax
 
     surroundings = {
@@ -305,7 +306,8 @@ def TurnTo(turtle, rel_angle_deg) -> bool:
         return False
 
     # Initialize on first call or when switching from another behavior
-    if not turtle.mid["active"] or turtle.mid["type"] != "turn":
+    # Use .get() to safely check for keys
+    if not turtle.mid.get("active") or turtle.mid.get("type") != "turn":
         turtle.mid.update({
             "active": True,
             "type": "turn",
@@ -341,7 +343,8 @@ def GoTo(turtle: Turtlebot3Controller, rel_distance_cm: float) -> bool:
         return False
 
     # Initialize on first call or when switching from another behavior
-    if not turtle.mid["active"] or turtle.mid["type"] != "goto":
+    # Use .get() to safely check for keys
+    if not turtle.mid.get("active") or turtle.mid.get("type") != "goto":
         turtle.mid.update({
             "active": True,
             "type": "goto",
@@ -386,6 +389,32 @@ def GoTo(turtle: Turtlebot3Controller, rel_distance_cm: float) -> bool:
     # For very short distances, use a higher minimum to ensure completion
     if remaining < 0.3:  # Less than 30cm remaining
         vx = max(vx, 0.1)
+
+    # Check for obstacles in front
+    ranges = turtle.valueLaserRaw.get('ranges', [])
+    if ranges and len(ranges) == 360:
+        rmax = turtle.valueLaserRaw.get('range_max', float('inf'))
+        ranges = [rmax if r == 0.0 or math.isinf(r) else r for r in ranges]
+        
+        # Check front sector (0 to 30 degrees and 330 to 360 degrees)
+        front_ranges = ranges[0:30] + ranges[330:360]
+        min_front_dist = min(front_ranges) if front_ranges else rmax
+        
+        # Safety threshold - stop if wall is too close
+        WALL_SAFETY_DISTANCE = 0.15  # 15cm safety margin
+        
+        if min_front_dist < WALL_SAFETY_DISTANCE:
+            turtle.publishVelocityCommand(0.0, 0.0)
+            turtle.mid["active"] = False
+            turtle.get_logger().warn(f'GoTo stopped early - wall detected at {min_front_dist*100:.1f}cm (remaining: {remaining*100:.1f}cm)')
+            return True  # Return True to indicate completion (even if not at exact target)
+        
+        # Slow down if approaching wall
+        WALL_SLOWDOWN_DISTANCE = 0.25  # 25cm - start slowing down
+        if min_front_dist < WALL_SLOWDOWN_DISTANCE:
+            slowdown_factor = (min_front_dist - WALL_SAFETY_DISTANCE) / (WALL_SLOWDOWN_DISTANCE - WALL_SAFETY_DISTANCE)
+            vx = vx * slowdown_factor
+            vx = max(vx, min_velocity * 0.5)  # Ensure some minimum movement
 
     # Heading correction to maintain straight line
     yaw_err = normalize_angle_rad(turtle.mid["ref_yaw"] - turtle.yaw)
@@ -449,116 +478,289 @@ def GoUntil(turtle: Turtlebot3Controller, directions_to_monitor: dict[str, bool]
 def AlignSelf(turtle, side='left') -> bool:
     """
     Aligns the robot to be parallel to a wall on the given side.
-    side: 'left' or 'right'.
+    side: 'left'/'right' (legacy) or cardinal 'north'|'east'|'south'|'west'.
     Returns True when alignment is complete.
     """
     if not turtle.have_odom:
         turtle.publishVelocityCommand(0.0, 0.0)
         return False
 
-    wall_angle_deg = 90 if side == 'left' else 270
-    angle_spread_deg = 15
+    s = str(side).lower()
+    mapping = {
+        'north': 0,
+        'east': 270,
+        'south': 180,
+        'west': 90,
+        'right':270,   # legacy
+        'left': 90,   # legacy
+    }
+    if s not in mapping:
+        turtle.get_logger().warn(f'AlignSelf: unknown side "{side}"')
+        return False
+    RANGER_OFFSET = -4.5 # installation offset
+    wall_angle_deg = (mapping[s] + RANGER_OFFSET) % 360
+    angle_spread_deg = 20
 
-    # Initialize on first call or when switching from another behavior
     if not turtle.mid.get("active") or turtle.mid.get("type") != "align":
         turtle.mid.update({
             "active": True,
             "type": "align",
+            "align_side": s,
         })
-        turtle.get_logger().info(f'Starting alignment with {side} wall')
+        turtle.get_logger().info(f'Starting alignment with {s} wall')
 
-    ranges = turtle.valueLaserRaw['ranges']
+    ranges = turtle.valueLaserRaw.get('ranges', [])
     if len(ranges) != 360:
-        return False # Not ready
+        return False  # Not ready yet
 
-    # Angles for sampling, relative to robot's front
-    angle1 = (wall_angle_deg - angle_spread_deg) % 360
-    angle2 = (wall_angle_deg + angle_spread_deg) % 360
+    angle1 = int((wall_angle_deg - angle_spread_deg) % 360)
+    angle2 = int((wall_angle_deg + angle_spread_deg) % 360)
 
+    rmax = turtle.valueLaserRaw.get('range_max', float('inf'))
     range1 = ranges[angle1]
     range2 = ranges[angle2]
-    
-    rmax = turtle.valueLaserRaw['range_max']
     if range1 == 0.0 or math.isinf(range1): range1 = rmax
     if range2 == 0.0 or math.isinf(range2): range2 = rmax
 
     err = range1 - range2
-    
-    ALIGN_TOL = 0.01 # 1cm
+
+    ALIGN_TOL = 0.005  # 0.5 cm
     if abs(err) <= ALIGN_TOL:
         turtle.publishVelocityCommand(0.0, 0.0)
         turtle.mid["active"] = False
-        turtle.get_logger().info(f'Alignment complete (error: {err:.4f} m)')
+        turtle.get_logger().info(f'Alignment complete to {s} (error: {err:.4f} m)')
         return True
 
-    # Proportional control for turning
-    Kp_align = 1.5
-    wz = clamp(Kp_align * err, -ANG_MAX, ANG_MAX)
+    Kp_align = 4.0
+    MIN_ROT = 0.05
+    wz = clamp(err/abs(err) * max(abs(Kp_align * err), MIN_ROT), -ANG_MAX, ANG_MAX)
     turtle.publishVelocityCommand(0.0, wz)
-    
     return False
 
-
-def GoToNextNode(turtle, distance_cm=20) -> bool:
+def GoToNextNode(turtle, prefer_turn='left', node_distance_cm=30) -> bool:
     """
-    Aligns to a wall, turns if needed, and moves forward.
+    Aligns to a wall, turns if needed, and moves forward to the next grid node.
     This is a stateful action using turtle.mid.
+    
+    Args:
+        turtle: The TurtleBot3 controller instance
+        prefer_turn: Preferred turn direction - 'front', 'left', 'right', or 'back' (default: 'left')
+        node_distance_cm: Grid spacing in centimeters (default: 30)
+    
     Returns True when complete.
     """
-    # Initialize GoToNextNode state
-    if turtle.mid.get("type") != "gotonextnode":
+    # Initialize GoToNextNode state with a separate namespace
+    if not hasattr(turtle, 'gtn_state') or turtle.gtn_state.get("active") != True:
+        # Measure distance to front wall
         ranges = turtle.valueLaserRaw['ranges']
-        if not ranges or len(ranges) != 360: return False
+        if not ranges or len(ranges) != 360: 
+            return False
         rmax = turtle.valueLaserRaw['range_max']
         ranges = [rmax if r == 0.0 or math.isinf(r) else r for r in ranges]
+
+        front_ranges = ranges[0:30] + ranges[330:360]
+        front_dist_m = min(front_ranges) if front_ranges else rmax
+        front_dist_cm = front_dist_m * 100.0
         
-        left_ranges = ranges[75:105]
-        right_ranges = ranges[255:285]
+        # Calculate initial offset from grid
+        initial_offset_cm = front_dist_cm % node_distance_cm
+        
+        turtle.get_logger().info(f'Front wall distance: {front_dist_cm:.1f}cm, initial offset: {initial_offset_cm:.1f}cm')
+
+        left_ranges = ranges[85:95]
+        right_ranges = ranges[265:275]
+        back_ranges = ranges[175:185]
+
         left_dist = min(left_ranges) if left_ranges else rmax
         right_dist = min(right_ranges) if right_ranges else rmax
-        
+        back_dist = min(back_ranges) if back_ranges else rmax
+
+        # Choose side: prefer the closer side wall (left/right).
+        # If the back (south) wall is noticeably closer than both side walls, align to south.
         side = 'left' if left_dist < right_dist else 'right'
+        SOUTH_MARGIN = 0.1  # require back to be this much closer to prefer south
+        if back_dist + SOUTH_MARGIN < min(left_dist, right_dist):
+            side = 'south'
 
-        turtle.mid.update({
-            "type": "gotonextnode",
-            "state": "aligning", # aligning, deciding, turning, moving
+        turtle.gtn_state = {
+            "active": True,
+            "state": "offsetting",
             "align_side": side,
-            "distance_cm": distance_cm,
-        })
-        turtle.mid['active'] = False 
-        turtle.get_logger().info(f'GoToNextNode started: align to {side}, then move {distance_cm}cm')
+            "prefer_turn": prefer_turn.lower(),
+            "node_distance_cm": node_distance_cm,
+            "initial_offset_cm": 15,
+        }
+        # Clear turtle.mid to allow sub-functions to initialize
+        turtle.mid.clear()
+        turtle.get_logger().info(f'GoToNextNode started: initial offset {initial_offset_cm:.1f}cm, will move one node ({node_distance_cm}cm)')
 
-    state = turtle.mid["state"]
+    state = turtle.gtn_state["state"]
+    turtle.get_logger().info(f'GoToNextNode state: {state}')
+
+    if state == "offsetting":
+        # Move forward until (front_dist % node_distance) <= initial_offset
+        # This means we've reached the next grid node
+        ranges = turtle.valueLaserRaw.get('ranges', [])
+        if not ranges or len(ranges) != 360:
+            return False
+            
+        rmax = turtle.valueLaserRaw.get('range_max', float('inf'))
+        ranges = [rmax if r == 0.0 or math.isinf(r) else r for r in ranges]
+        
+        front_ranges = ranges[0:1] + ranges[359:360]
+        current_front_dist_m = min(front_ranges) if front_ranges else rmax
+        current_front_dist_cm = current_front_dist_m * 100.0
+        current_offset_cm = current_front_dist_cm % turtle.gtn_state["node_distance_cm"]
+        
+        initial_offset_cm = turtle.gtn_state["initial_offset_cm"]
+        
+        # Check if we've reached a node (current offset <= initial offset)
+        # Add small tolerance
+        OFFSET_TOLERANCE = 0.2  # cm
+        if current_offset_cm <= initial_offset_cm + OFFSET_TOLERANCE:
+            turtle.publishVelocityCommand(0.0, 0.0)
+            turtle.gtn_state["state"] = "aligning"
+            turtle.mid.clear()
+            turtle.get_logger().info(f'GoToNextNode: reached grid node (offset: {current_offset_cm:.1f}cm), now aligning')
+            return False
+        
+        # Continue moving forward with obstacle avoidance
+        # Check for wall safety
+        WALL_SAFETY_DISTANCE = 0.15  # 15cm
+        if current_front_dist_m < WALL_SAFETY_DISTANCE:
+            turtle.publishVelocityCommand(0.0, 0.0)
+            turtle.gtn_state["state"] = "aligning"
+            turtle.mid.clear()
+            turtle.get_logger().warn(f'GoToNextNode: wall too close at {current_front_dist_cm:.1f}cm, stopping offset')
+            return False
+        
+        # Move forward at controlled speed
+        forward_speed = 0.1
+        turtle.publishVelocityCommand(forward_speed, 0.0)
+        return False
 
     if state == "aligning":
-        if AlignSelf(turtle, side=turtle.mid["align_side"]):
-            turtle.mid["state"] = "deciding"
-            turtle.mid['active'] = False
-            turtle.get_logger().info('GoToNextNode: alignment finished.')
+        # Call AlignSelf and check if it completes
+        if AlignSelf(turtle, side=turtle.gtn_state["align_side"]):
+            turtle.gtn_state["state"] = "deciding"
+            turtle.mid.clear()
+            turtle.get_logger().info('GoToNextNode: alignment finished, moving to deciding state')
+        return False
     
-    elif state == "deciding":
+    if state == "deciding":
         surroundings = DetectSurroundings(turtle)
-        if surroundings['north']:
-            turtle.mid['state'] = 'turning'
-            turtle.get_logger().info('GoToNextNode: front is blocked, turning.')
+        prefer = turtle.gtn_state.get("prefer_turn", "left")
+        
+        # Build priority list based on preference
+        if prefer == 'front':
+            turn_priority = [
+                ('north', 'front', 0),      # Front (no turn)
+                ('west', 'left', 90),       # Left
+                ('east', 'right', -90),     # Right
+                ('south', 'back', 180),     # Back
+            ]
+        elif prefer == 'left':
+            turn_priority = [
+                ('west', 'left', 90),       # Left
+                ('north', 'front', 0),      # Front
+                ('east', 'right', -90),     # Right
+                ('south', 'back', 180),     # Back
+            ]
+        elif prefer == 'right':
+            turn_priority = [
+                ('east', 'right', -90),     # Right
+                ('north', 'front', 0),      # Front
+                ('west', 'left', 90),       # Left
+                ('south', 'back', 180),     # Back
+            ]
+        elif prefer == 'back':
+            turn_priority = [
+                ('south', 'back', 180),     # Back
+                ('west', 'left', 90),       # Left
+                ('east', 'right', -90),     # Right
+                ('north', 'front', 0),      # Front
+            ]
         else:
-            turtle.mid['state'] = 'moving'
-            turtle.get_logger().info('GoToNextNode: front is clear, moving.')
-        turtle.mid['active'] = False
+            # Default to front if invalid preference
+            turn_priority = [
+                ('north', 'front', 0),
+                ('west', 'left', 90),
+                ('east', 'right', -90),
+                ('south', 'back', 180),
+            ]
+        
+        # Try each direction in priority order
+        turned = False
+        for direction, turn_name, angle in turn_priority:
+            if not surroundings[direction]:  # This direction is clear
+                if angle == 0:  # No turn needed, go straight
+                    turtle.gtn_state['state'] = 'moving'
+                    turtle.mid.clear()  # Clear for GoTo
+                    turtle.get_logger().info(f'GoToNextNode: front is clear, will move forward')
+                else:  # Need to turn
+                    turtle.gtn_state['state'] = 'turning'
+                    turtle.gtn_state['turn_direction'] = turn_name
+                    turtle.gtn_state['turn_angle'] = angle
+                    turtle.mid.clear()  # Clear for TurnTo
+                    turtle.get_logger().info(f'GoToNextNode: turning {turn_name.upper()} ({direction} is clear)')
+                turned = True
+                break
+        
+        if not turned:
+            # Completely surrounded - this shouldn't happen, but handle it
+            turtle.get_logger().error('GoToNextNode: robot is surrounded by walls!')
+            turtle.gtn_state['state'] = 'turning'
+            turtle.gtn_state['turn_direction'] = 'emergency'
+            turtle.gtn_state['turn_angle'] = 90  # Try turning left anyway
+            turtle.mid.clear()
+        return False
 
-    elif state == "turning":
-        turn_angle = 90 if turtle.mid["align_side"] == 'right' else -90
+    if state == "turning":
+        turn_angle = turtle.gtn_state.get("turn_angle", 90)
         if TurnTo(turtle, turn_angle):
-            turtle.mid["state"] = "moving"
-            turtle.mid['active'] = False
-            turtle.get_logger().info(f'GoToNextNode: turned {turn_angle}.')
+            turtle.gtn_state["state"] = "aligning_after_turn"
+            turtle.mid.clear()  # Clear for AlignSelf
+            turtle.get_logger().info(f'GoToNextNode: turned {turn_angle} degrees, now aligning')
+        return False
     
-    elif state == "moving":
-        if GoTo(turtle, turtle.mid["distance_cm"]):
-            turtle.mid["type"] = None
-            turtle.mid["active"] = False
-            turtle.get_logger().info('GoToNextNode: finished.')
+    if state == "aligning_after_turn":
+        # Determine which wall to align to after turning
+        ranges = turtle.valueLaserRaw['ranges']
+        if not ranges or len(ranges) != 360: 
+            return False
+        rmax = turtle.valueLaserRaw['range_max']
+        ranges = [rmax if r == 0.0 or math.isinf(r) else r for r in ranges]
+
+        left_ranges = ranges[85:95]
+        right_ranges = ranges[265:275]
+        back_ranges = ranges[175:185]
+
+        left_dist = min(left_ranges) if left_ranges else rmax
+        right_dist = min(right_ranges) if right_ranges else rmax
+        back_dist = min(back_ranges) if back_ranges else rmax
+
+        # Choose side: prefer the closer side wall (left/right).
+        # If the back (south) wall is noticeably closer than both side walls, align to south.
+        align_side = 'left' if left_dist < right_dist else 'right'
+        SOUTH_MARGIN = 0.1  # require back to be this much closer to prefer south
+        if back_dist + SOUTH_MARGIN < min(left_dist, right_dist):
+            align_side = 'south'
+        
+        if AlignSelf(turtle, side=align_side):
+            turtle.gtn_state["state"] = "moving"
+            turtle.mid.clear()  # Clear for GoTo
+            turtle.get_logger().info(f'GoToNextNode: post-turn alignment complete')
+        return False
+    
+    if state == "moving":
+        # Move forward by approximately one node distance
+        if GoTo(turtle, turtle.gtn_state["node_distance_cm"]):
+            # Clean up state when completely done
+            turtle.gtn_state = {"active": False}
+            turtle.mid.clear()
+            turtle.get_logger().info('GoToNextNode: reached next node, complete')
             return True
+        return False
             
     return False
 
